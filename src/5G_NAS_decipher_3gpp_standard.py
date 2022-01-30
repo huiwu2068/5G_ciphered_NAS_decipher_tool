@@ -2,7 +2,7 @@ import tkinter
 from tkinter.filedialog import askopenfilename
 import threading
 import queue
-from Crypto.Hash import HMAC, SHA256
+from Crypto.Hash import HMAC, SHA256, CMAC
 from Crypto.Cipher import AES
 import pyshark
 import sys
@@ -13,6 +13,9 @@ from time import sleep as module_time_sleep
 import logging
 import logging.handlers
 from CryptoMobile.Milenage import Milenage
+#from CryptoMobile.CMAC import CMAC
+#from CryptoMobile.AES import AES_ECB, AES_CTL
+
 # import traceback
 import pysnow
 import pyzuc
@@ -379,11 +382,17 @@ class Decryption:
             ran_ue_ngap_id = packet.ngap.ran_ue_ngap_id.raw_value
             # get encryption algorithm from security mode command message.
             algorithm_id = packet.ngap.nas_pdu.raw_value[20]
+
+            # get interity algorithm from security mode command message.
+            integrity_algorithm_id = packet.ngap.nas_pdu.raw_value[21]
+
             # if null encryption , exit and do nothing.
             self.ue_dict[ran_ue_ngap_id][gnb_ip]['algorithm_id'] = algorithm_id
+            self.ue_dict[ran_ue_ngap_id][gnb_ip]['integrity_algorithm_id'] = integrity_algorithm_id
+
             # algorithm_id ='0' for null encryption, '1' for snow3G, '2' for 'AES', '3' for ZUC
-            if algorithm_id == '0':
-                return False
+            #if algorithm_id == '0':
+            #    return False
             if (ran_ue_ngap_id not in self.ue_dict) or (gnb_ip not in
                 self.ue_dict[ran_ue_ngap_id]) or ('kamf' not in self.ue_dict[ran_ue_ngap_id][gnb_ip]):
                 return False
@@ -395,7 +404,14 @@ class Decryption:
             # so get the last 16 bytes of bytes string only for cipher_key.
             # should add more logic here, add cipher_key only if auth is successful.
             cipher_key = bytes.fromhex(HMAC.new(input_key, input_string, SHA256).hexdigest())[16:]
+
+            algorithm_type_interity_dist = b'\x02'   #type_id for nas interity_key
+            input_string = b'\x69' + algorithm_type_interity_dist + b'\x00\x01' + \
+                           bytes.fromhex('0'+integrity_algorithm_id) + b'\x00\x01'
+            integrity_key = bytes.fromhex(HMAC.new(input_key, input_string, SHA256).hexdigest())[16:]
+
             self.ue_dict[ran_ue_ngap_id][gnb_ip]['cipher_key'] = cipher_key
+            self.ue_dict[ran_ue_ngap_id][gnb_ip]['integrity_key'] = integrity_key
             logger.info("compute alg_enc key successfully!\n")
             return True
         except Exception as e:
@@ -490,6 +506,111 @@ class Decryption:
             if plain_payload and plain_payload.startswith(b'\x7e'):
                 self.buffer = self.buffer.replace(nas_pdu,outer_header+plain_payload)
                 return True
+        except Exception as e:
+            logger.warning(f'error: error deciphering '
+                       f' packet : IP identification: {packet.ip.id.raw_value},'
+                       f'src IP:{packet.ip.src} \n')
+            logger.warning(f'the error info is : {str(e)}\n')
+            #traceback.print_exc(file=sys.stdout)
+            #traceback.print_stack(file=sys.stdout)
+
+        return False
+
+    def check_integrity_nas(self,packet,gnb_ip,direction):
+        ran_ue_ngap_id= packet.ngap.ran_ue_ngap_id.raw_value
+        if (ran_ue_ngap_id not in self.ue_dict) or (gnb_ip not in
+            self.ue_dict[ran_ue_ngap_id]) or ('integrity_key' not in 
+            self.ue_dict[ran_ue_ngap_id][gnb_ip]):
+            logger.warning(f'error: no cipher key available for this UE found,'
+                           f'skip packet : IP identification: {packet.ip.id.raw_value},'
+                           f'src IP:{packet.ip.src} \n')
+            return False
+        try:
+            # get seq in message by converting string of hex value into integer.
+            msg_nas_count = int(packet.ngap.nas_5gs_seq_no.raw_value,base=16)        # msg_nas_count is integer.
+            # if it's downlink tansport packet.
+            if direction == 1:
+                if 'local_downlink_nas_count' in self.ue_dict[ran_ue_ngap_id][gnb_ip]:
+                    # local nas count in dict is stored as an integer.
+                    local_nas_count = self.ue_dict[ran_ue_ngap_id][gnb_ip]['local_downlink_nas_count']
+                else:
+                    local_nas_count = 0
+            # elif it's uplink transport packet.
+            else:
+                if 'local_uplink_nas_count' in self.ue_dict[ran_ue_ngap_id][gnb_ip]:
+                    local_nas_count = self.ue_dict[ran_ue_ngap_id][gnb_ip]['local_uplink_nas_count']
+                else:
+                    local_nas_count = 0
+            # end if
+            count_for_ciphering = None
+            # if incoming packet's seq is higher than or same as previous one.
+            if msg_nas_count % 256 >= local_nas_count % 256 :
+                count_for_ciphering = local_nas_count = (local_nas_count//256)*256 + msg_nas_count % 256
+            # elif incoming packet's seq is smaller than previous one.
+            elif msg_nas_count % 256 < local_nas_count % 256 :
+                # assume wrap around of seq happens with no more than 10 packets lost.
+                if local_nas_count % 256 > 250 and msg_nas_count % 256 < 5:
+                    count_for_ciphering = local_nas_count = (local_nas_count//256+1) * 256 + msg_nas_count % 256
+                else:
+                    count_for_ciphering = local_nas_count // 256 + msg_nas_count % 256
+            # end if
+
+            # save local_nas_count back to dict.
+            if direction == 1:
+                self.ue_dict[ran_ue_ngap_id][gnb_ip]['local_downlink_nas_count'] = local_nas_count
+            elif direction == 0:
+                self.ue_dict[ran_ue_ngap_id][gnb_ip]['local_uplink_nas_count'] = local_nas_count
+            # end if
+
+            integrity_key = self.ue_dict[ran_ue_ngap_id][gnb_ip]['integrity_key']
+
+            # whole nas pdu including the outer security header and mac
+            if hasattr(packet.ngap,'nas_pdu'):
+                nas_pdu = bytes.fromhex(packet.ngap.nas_pdu.raw_value)
+            elif hasattr(packet.ngap,'pdusessionnas_pdu'):
+                nas_pdu = bytes.fromhex(packet.ngap.pdusessionnas_pdu.raw_value)
+            else:
+                raise Exception('no nas_pdu found!')
+            # get outer security header and mac+seq.
+            message_auth_code = nas_pdu[2:6]
+
+            # get ciphered payload only.
+            ciphered_payload = nas_pdu[7:]
+            # initial counter block for AES input  should be :
+            # COUNT[0] .. COUNT[31] │ BEARER[0] .. BEARER[4] │ DIRECTION │ 0^26 (i.e. 26 zero bits)
+            bearer = self.new_bearer_id  # bearer would be 0 in old spec 33.501 and 1 in new spec.
+            first_byte_of_bearer_and_direction = (bearer<<3)|(direction<<2)
+            #plain_payload = None
+            # if AES ciphering:
+            # algorithm_id = self.ue_dict[ran_ue_ngap_id][gnb_ip]['algorithm_id']
+            if self.ue_dict[ran_ue_ngap_id][gnb_ip]['integrity_algorithm_id'] == '2' and count_for_ciphering is not None:
+                # counter_block for AES should be 16 bytes long binary string.
+                counter_block = count_for_ciphering.to_bytes(4,byteorder='big') + \
+                                first_byte_of_bearer_and_direction.to_bytes(1,byteorder='big') + \
+                                b'\x00\x00\x00'
+                #crypto = AES.new(integrity_key, mode=AES.MODE_CTR, nonce=counter_block[0:8],initial_value=counter_block[8:16])
+                #plain_payload = crypto.decrypt(ciphered_payload)
+                
+                msg=counter_block + ciphered_payload
+                h1 = CMAC.new(integrity_key, ciphermod=AES)
+                computed_mac_tag = h1.update(msg)
+
+                #cmac = CMAC(integrity_key, AES_ECB, Tlen=32)
+                #computed_mac_tag = cmac.cmac(msg)
+
+            # elif snow3G algorithm:
+            elif self.ue_dict[ran_ue_ngap_id][gnb_ip]['integrity_algorithm_id'] == '1' and count_for_ciphering is not None:
+                plain_payload = pysnow.snow_f8(integrity_key, count_for_ciphering, bearer,
+                                               direction, ciphered_payload, len(ciphered_payload)*8)
+            # elif ZUC algorithm:
+            elif self.ue_dict[ran_ue_ngap_id][gnb_ip]['integrity_algorithm_id'] == '3' and count_for_ciphering is not None:
+                plain_payload = pyzuc.zuc_eea3(integrity_key, count_for_ciphering, bearer,
+                                               direction, len(ciphered_payload) * 8, ciphered_payload)
+            # end if
+
+            if computed_mac_tag != message_auth_code:
+                logger.warning(f'computed_mac_tag != message_auth_code \n')
+            return True
         except Exception as e:
             logger.warning(f'error: error deciphering '
                        f' packet : IP identification: {packet.ip.id.raw_value},'
@@ -638,6 +759,9 @@ class Decryption:
 
                 # direction parameter for ciphering input, 0 for uplink and 1 for downlink.
                 direction = 1
+
+                self.check_integrity_nas(packet, gnb_ip, direction)
+
                 security_header_type = packet.ngap.nas_5gs_security_header_type.raw_value
                 # if it's plain nas message:
                 if security_header_type == '0':
@@ -699,6 +823,9 @@ class Decryption:
                     continue
 
                 direction = 0
+
+                self.check_integrity_nas(packet, gnb_ip, direction)
+
                 security_header_type = packet.ngap.nas_5gs_security_header_type.raw_value
                 # if plain nas message:
                 if security_header_type == '0' or security_header_type == '1' or security_header_type == '3':
